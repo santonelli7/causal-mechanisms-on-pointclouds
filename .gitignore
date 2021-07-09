@@ -1,0 +1,7 @@
+.vscode/
+todo.txt
+wandb/
+data/
+checkpoints/
+src/__pycache__/
+src/datasets/__pycache__/
