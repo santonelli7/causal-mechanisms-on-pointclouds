@@ -58,6 +58,8 @@ class Trainer():
 
         # Restore from last save
         self._current_epoch = 1
+        self._current_step = 0
+        self.loss = {}
 
     def _prepare_loader(self) -> Tuple[DataLoader, DataLoader]:
         """
@@ -84,14 +86,21 @@ class Trainer():
         assert len(optimizers) == len(self.experts) + 1
         return optimizers
     
-    def _initialize_experts(self) -> None:
+    def initialize_experts(self) -> None:
         """
             Loop to initialize all experts.
 
             :param optimizers:
         """
-        for i, (expert, optimizer) in enumerate(zip(self.experts, self.optimizers[:-1])):
+        for i, (expert, optimizer) in enumerate(zip(self.experts, self.optimizers[:-1]), 1):
             self._initialize_expert(expert, i, optimizer)
+
+            # save initialization                       
+            init = {
+                'model': expert.state_dict(),
+                'optim': optimizer.state_dict()
+            }
+            torch.save(init, f'{self.hparams.models_path}/init/Expert_{i}_init.pth')
 
     def _initialize_expert(self, expert: Expert, i: int, optimizer: optim.Optimizer) -> None:
         """
@@ -101,7 +110,7 @@ class Trainer():
             :param i:
             :param optimizer:
         """
-        print(f'Initializing expert {i+1} as identity on perturbed data')
+        print(f'Initializing expert {i} as identity on perturbed data')
         expert.train()
         for epoch in range(1, self.hparams.epochs_init + 1):
             n_samples = 0
@@ -119,10 +128,6 @@ class Trainer():
                 optimizer.step()
                 progress_bar.set_description(f'Epoch {epoch}')
                 progress_bar.set_postfix({'loss': total_loss/n_samples})
-            if epoch % 3 == 0:
-                expert.save(f'{self.hparams.models_path}/init/Expert_{i+1}_init.pth')
-                        
-        expert.save(f'{self.hparams.models_path}/init/Expert_{i+1}_init.pth')
 
     def train(self, initialize: bool = False) -> None:
         """
@@ -141,10 +146,6 @@ class Trainer():
         models = tuple(self.experts)
         models += (self.discriminator,)
         wandb.watch(models, log="all")
-
-        # initialize experts
-        if initialize:
-            self._initialize_experts()
 
         if wandb.run.resumed and os.path.isfile(f'{self.hparams.models_path}/ckpt.pth'):
             # restore the model
@@ -186,7 +187,7 @@ class Trainer():
             self._training_step(idx, data, losses)
 
         D_loss = sum(losses['D_batch_loss']) / len(losses['D_batch_loss'])
-        self.loss = {'D_loss': D_loss}
+        self.loss = {'epoch': epoch, 'D_loss': D_loss}
         for i in range(len(self.experts)):
             E_loss = sum(losses['E_batch_loss'][i]) / len(losses['E_batch_loss'][i])
             self.loss[f'E_{i+1}_loss'] = E_loss
@@ -199,7 +200,7 @@ class Trainer():
         :param data: current training batch
         :param losses: dictionary of the losses
         """
-        
+        self._current_step += idx
 
         data = data.to(self.hparams.device)
         x_canon, x_transf = data.pos, data.pos_transf
@@ -208,8 +209,8 @@ class Trainer():
         batch_size = data.num_graphs
 
         # Adversarial ground truths
-        valid = Variable(torch.FloatTensor(batch_size, 1).fill_(1.0), requires_grad=False)
-        fake = Variable(torch.FloatTensor(batch_size, 1).fill_(0.0), requires_grad=False)
+        valid = Variable(torch.FloatTensor(batch_size, 1).fill_(1.0), requires_grad=False).to(self.hparams.device)
+        fake = Variable(torch.FloatTensor(batch_size, 1).fill_(0.0), requires_grad=False).to(self.hparams.device)
 
         self.optimizers[-1].zero_grad()
 
@@ -236,7 +237,7 @@ class Trainer():
         self.optimizers[-1].step()
 
         losses['D_batch_loss'].append(d_loss.item())
-        batch_losses = {'D_batch_loss': d_loss.item()}
+        batch_losses = {'D_batch_loss': d_loss.item(), 'step': self._current_step}
         
         # Train experts
         exp_outputs = torch.cat(exp_outputs, dim=1)
@@ -286,6 +287,7 @@ class Trainer():
         print('Loading checkpoint...')
         ckpt = torch.load(f'{self.hparams.models_path}/ckpt.pth', map_location=self.hparams.device)
         self._current_epoch = ckpt['epoch'] + 1
+        self._current_step = ckpt['epoch'] * len(self.train_loader)
         self.loss['D_loss'] = ckpt['D_loss']
         self.discriminator.load_state_dict(ckpt['D_state_dict'])
         self.optimizers[-1].load_state_dict(ckpt['D_optim'])

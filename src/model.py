@@ -1,13 +1,11 @@
 from src.arguments import Args
-from typing import Optional
-from pathlib import Path
 
 import torch
 import torch.nn as nn
 from torch.nn import Sequential as Seq, Linear as Lin, LeakyReLU, Dropout
 import torch.nn.functional as F
 
-from torch_geometric.nn import DynamicEdgeConv, global_max_pool, BatchNorm as BN
+from torch_geometric.nn import DynamicEdgeConv, BatchNorm as BN
 
 def MLP(channels):
     return Seq(*[
@@ -48,7 +46,7 @@ class Discriminator(nn.Module):
         for inx in range(self.layer_num):
             self.fc_layers.append(nn.Conv1d(channels[inx], channels[inx+1], kernel_size=1, stride=1))
 
-        self.leaky_relu = nn.LeakyReLU(negative_slope=0.2)
+        self.leaky_relu = LeakyReLU(negative_slope=0.2)
         self.final_layer = nn.Sequential(nn.Linear(channels[-1], channels[-1]),
                                          nn.Linear(channels[-1], channels[-2]),
                                          nn.Linear(channels[-2], channels[-2]),

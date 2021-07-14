@@ -1,5 +1,6 @@
 from pathlib import Path
-from dataclasses import dataclass
+from typing import List
+from dataclasses import dataclass, field
 import torch
 
 @dataclass
@@ -20,7 +21,7 @@ class Args:
     lr: float = 1e-3
     k: int = 20
     aggr: str = 'max'
-    D_channels: list = [3,  64,  128, 256, 512, 1024]
+    D_channels: List = field(default_factory=lambda: [3,  64,  128, 256, 512, 1024])
     in_channels: int = 3
     num_points: int = 1024
     n_cpu: int = 1

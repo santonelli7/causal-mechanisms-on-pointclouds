@@ -5,3 +5,5 @@ data/
 checkpoints/
 src/__pycache__/
 src/datasets/__pycache__/
+src/losses/__pycache__/
+src/losses/cuda/chamfer_distance/__pycache__/
