@@ -19,6 +19,8 @@ class Args:
     epochs_init: int = 10
     epochs: int = 1000
     lr: float = 1e-3
+    b1: float = 0.5
+    b2: float = 0.999
     k: int = 20
     aggr: str = 'max'
     D_channels: List = field(default_factory=lambda: [3,  64,  128, 256, 512, 1024])

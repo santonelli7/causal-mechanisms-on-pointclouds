@@ -18,7 +18,7 @@ from torch.autograd import Variable
 from torch_geometric.data import DataLoader, Batch
 
 class Trainer():
-    def __init__(self, hparams: Args, experts: Expert, discriminator: Discriminator, train_dataset, test_dataset = None):
+    def __init__(self, hparams: Args, expert: Expert, discriminator: Discriminator, train_dataset, test_dataset = None):
         """
         :param hparams: dictionary that contains all the hyperparameters
         :param experts:
@@ -30,13 +30,13 @@ class Trainer():
         self.hparams = hparams
         
         # Experts
-        self.experts = [expert.to(self.hparams.device) for expert in experts]
+        self.expert = expert.to(self.hparams.device)
 
         # Discriminators
         self.discriminator = discriminator.to(self.hparams.device)
 
         # Optimizers
-        self.optimizers = self._configure_optimizers()
+        self.E_optimizer, self.D_optimizer = self._configure_optimizers()
 
         # Datasets
         self.train_dataset = train_dataset
@@ -54,7 +54,9 @@ class Trainer():
 
         # Losses
         self.chamfer = ChamferDistanceLoss()
+        self.chamfer.to(self.hparams.device)
         self.bce = torch.nn.BCELoss()
+        self.bce.to(self.hparams.device)
 
         # Restore from last save
         self._current_epoch = 1
@@ -80,29 +82,12 @@ class Trainer():
         :returns: the optimizers
         """
         # Experts optimizers
-        optimizers = [optim.Adam(expert.parameters(), lr=self.hparams.lr) for expert in self.experts]
+        E_optimizer = optim.Adam(self.expert.parameters(), lr=self.hparams.lr, betas=(self.hparams.b1, self.hparams.b1))
         # Discriminator optimizer
-        optimizers.append(optim.Adam(self.discriminator.parameters(), lr=self.hparams.lr))
-        assert len(optimizers) == len(self.experts) + 1
-        return optimizers
-    
-    def initialize_experts(self) -> None:
-        """
-            Loop to initialize all experts.
+        D_optimizer = optim.Adam(self.discriminator.parameters(), lr=self.hparams.lr, betas=(self.hparams.b1, self.hparams.b1))
+        return E_optimizer, D_optimizer
 
-            :param optimizers:
-        """
-        for i, (expert, optimizer) in enumerate(zip(self.experts, self.optimizers[:-1]), 1):
-            self._initialize_expert(expert, i, optimizer)
-
-            # save initialization                       
-            init = {
-                'model': expert.state_dict(),
-                'optim': optimizer.state_dict()
-            }
-            torch.save(init, f'{self.hparams.models_path}/init/Expert_{i}_init.pth')
-
-    def _initialize_expert(self, expert: Expert, i: int, optimizer: optim.Optimizer) -> None:
+    def initialize_expert(self) -> None:
         """
             Initialization of the expert as identity.
 
@@ -110,8 +95,9 @@ class Trainer():
             :param i:
             :param optimizer:
         """
-        print(f'Initializing expert {i} as identity on perturbed data')
-        expert.train()
+        optimizer = optim.Adam(self.expert.parameters(), lr=self.hparams.lr)
+        print(f'Initializing expert as identity on perturbed data')
+        self.expert.train()
         for epoch in range(1, self.hparams.epochs_init + 1):
             n_samples = 0
             total_loss = 0
@@ -121,7 +107,7 @@ class Trainer():
                 n_samples += batch_size
                 data = data.to(self.hparams.device)
                 optimizer.zero_grad()
-                out = expert(pos=data.pos_transf, batch=data.pos_transf_batch)
+                out = self.expert(pos=data.pos_transf, batch=data.pos_transf_batch)
                 loss = self.chamfer(out.view(batch_size, -1, self.hparams.in_channels), data.pos_transf.view(batch_size, -1, self.hparams.in_channels))
                 loss.backward()
                 total_loss += loss.item() * batch_size
@@ -129,7 +115,15 @@ class Trainer():
                 progress_bar.set_description(f'Epoch {epoch}')
                 progress_bar.set_postfix({'loss': total_loss/n_samples})
 
-    def train(self, initialize: bool = False) -> None:
+        # save initialization                       
+        init = {
+            'model': self.expert.state_dict(),
+        }
+        if not os.path.isdir(os.path.join(self.hparams.models_path, 'init')):
+            os.mkdir(os.path.join(self.hparams.models_path, 'init'))
+        torch.save(init, os.path.join(self.hparams.models_path, 'init', 'expert.pth'))
+
+    def train(self) -> None:
         """
         Train the model in adversarial fashion.
 
@@ -143,19 +137,19 @@ class Trainer():
             'optimizer': 'adam',
         }
         wandb.init(id=self.hparams.id_wandb, project="causal-mechanisms-on-pointclouds", config=config, resume=self.hparams.resume)
-        models = tuple(self.experts)
-        models += (self.discriminator,)
+        models = (self.discriminator, self.expert)
         wandb.watch(models, log="all")
 
-        if wandb.run.resumed and os.path.isfile(f'{self.hparams.models_path}/ckpt.pth'):
-            # restore the model
-            self.load_checkpoint()
+        # if wandb.run.resumed and os.path.isfile(f'{self.hparams.models_path}/ckpt.pth'):
+        #     # restore the model
+        #     self.load_checkpoint()
 
         # train the models
         for epoch in range(self._current_epoch, self.hparams.epochs + 1):
             self._training_loop(epoch)
             
-            self.evaluation()
+            score = self.evaluation()
+            wandb.log({f'{self.train_dataset.idx_to_transf[0]}_scores': score, 'epoch': epoch})
 
             # save checkpoint
             self.save_checkpoint(epoch)
@@ -172,35 +166,32 @@ class Trainer():
         :param epoch:
         """
         self.discriminator.train()
-        for i, expert in enumerate(self.experts):
-            expert.train()
+        self.expert.train()
 
         # Keep track of losses
         losses = {
             'D_batch_loss': [],
-            'E_batch_loss': [[] for i in range(len(self.experts))],
+            'E_batch_loss': [],
         }
 
         # Iterate through data
         progress_bar = tqdm(enumerate(self.train_loader), desc=f'Epoch {epoch}', total=len(self.train_loader), bar_format='{desc}: {percentage:0.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]  {postfix}', ncols=500)
         for idx, data in progress_bar:
-            self._training_step(idx, data, losses)
+            self._current_step += 1
+            self._training_step(data, losses)
 
         D_loss = sum(losses['D_batch_loss']) / len(losses['D_batch_loss'])
-        self.loss = {'epoch': epoch, 'D_loss': D_loss}
-        for i in range(len(self.experts)):
-            E_loss = sum(losses['E_batch_loss'][i]) / len(losses['E_batch_loss'][i])
-            self.loss[f'E_{i+1}_loss'] = E_loss
+        E_loss = sum(losses['E_batch_loss']) / len(losses['E_batch_loss'])
+        self.loss = {'epoch': epoch, 'D_loss': D_loss, 'E_loss': E_loss}
         wandb.log(self.loss)
 
-    def _training_step(self, idx, data, losses):
+    def _training_step(self, data, losses):
         """
         Implements a single training step.
 
         :param data: current training batch
         :param losses: dictionary of the losses
         """
-        self._current_step += idx
 
         data = data.to(self.hparams.device)
         x_canon, x_transf = data.pos, data.pos_transf
@@ -212,53 +203,39 @@ class Trainer():
         valid = Variable(torch.FloatTensor(batch_size, 1).fill_(1.0), requires_grad=False).to(self.hparams.device)
         fake = Variable(torch.FloatTensor(batch_size, 1).fill_(0.0), requires_grad=False).to(self.hparams.device)
 
-        self.optimizers[-1].zero_grad()
+        # Train expert
+        self.E_optimizer.zero_grad()
+
+        fake_point = self.expert(pos=x_transf, batch=batch_transf)
+
+        G_fake = self.discriminator(pos=fake_point.view(batch_size, -1, 3))
+        g_loss = self.bce(G_fake, valid)
+
+        losses['E_batch_loss'].append(g_loss.item())
+
+        g_loss.backward()
+        self.E_optimizer.step()
+
+        # Train discriminator
+        self.D_optimizer.zero_grad()
 
         # Real points
         D_real = self.discriminator(pos=x_canon.view(batch_size, -1, 3))
         D_real_loss = self.bce(D_real, valid)
 
         # Fake points
-        D_fake_loss = 0
-        exp_outputs = []
-        exp_scores = []
-        for i, expert in enumerate(self.experts):
-            fake_point = expert(pos=x_transf, batch=batch_transf)
-            D_fake = self.discriminator(pos=fake_point.detach().view(batch_size, -1, 3))
-            D_fake_loss += self.bce(D_fake, fake)
-            exp_outputs.append(fake_point.view(batch_size, 1, -1, self.hparams.in_channels))
-            exp_scores.append(D_fake)
-        D_fake_loss = D_fake_loss / self.hparams.num_experts
-
+        D_fake = self.discriminator(pos=fake_point.detach().view(batch_size, -1, 3))
+        D_fake_loss = self.bce(D_fake, fake)
+        
         # Discriminator loss
         d_loss = (D_real_loss + D_fake_loss) / 2
 
-        d_loss.backward()
-        self.optimizers[-1].step()
-
         losses['D_batch_loss'].append(d_loss.item())
-        batch_losses = {'D_batch_loss': d_loss.item(), 'step': self._current_step}
-        
-        # Train experts
-        exp_outputs = torch.cat(exp_outputs, dim=1)
-        exp_scores = torch.cat(exp_scores, dim=1)
-        mask_winners = exp_scores.argmax(dim=1)
 
-        # Update each expert on samples it won
-        for i, expert in enumerate(self.experts):
-            
-            self.optimizers[i].zero_grad()
-            winning_indexes = mask_winners.eq(i).nonzero().squeeze(dim=-1)
-            n_expert_samples = winning_indexes.size(0)
-            if n_expert_samples > 0:
-                winning_samples = exp_outputs[winning_indexes, i]
-                G_fake = self.discriminator(pos=winning_samples)
-                g_loss = self.bce(G_fake, valid)
-                g_loss.backward()
-                self.optimizers[i].step()
+        d_loss.backward()
+        self.D_optimizer.step()
 
-                losses['E_batch_loss'][i].append(g_loss.item())
-                batch_losses[f'E_{i+1}_batch_loss'] = g_loss.item()
+        batch_losses = {'batch': self._current_step, 'D_batch_loss': d_loss.item(), 'E_batch_loss': g_loss.item()}
         wandb.log(batch_losses)
 
     def save_checkpoint(self, epoch: int) -> None:
@@ -268,13 +245,12 @@ class Trainer():
         ckpt = {
                 'epoch': epoch,
                 'D_state_dict': self.discriminator.state_dict(),
-                'D_optim': self.optimizers[-1].state_dict(),
+                'D_optim': self.D_optimizer.state_dict(),
                 'D_loss': self.loss['D_loss'],
-                }
-        for i, expert in enumerate(self.experts):
-            ckpt[f'E_{i+1}_state_dict'] =  expert.state_dict()
-            ckpt[f'E_{i+1}_loss'] = self.loss[f'E_{i+1}_loss']
-            ckpt[f'E_{i+1}_optim'] = self.optimizers[i].state_dict()
+                'E_state_dict':self.expert.state_dict(),
+                'E_loss': self.loss[f'E_loss'],
+                'E_optim': self.E_optimizer.state_dict(),
+        }
         
         torch.save(ckpt, f'{self.hparams.models_path}/ckpt.pth')
 
@@ -290,52 +266,34 @@ class Trainer():
         self._current_step = ckpt['epoch'] * len(self.train_loader)
         self.loss['D_loss'] = ckpt['D_loss']
         self.discriminator.load_state_dict(ckpt['D_state_dict'])
-        self.optimizers[-1].load_state_dict(ckpt['D_optim'])
-        for i, expert in enumerate(self.experts):
-            expert.load_state_dict(ckpt[f'E_{i+1}_state_dict'])
-            self.loss[f'E_{i+1}_loss'] = ckpt[f'E_{i+1}_loss']
-            self.optimizers[i].load_state_dict(ckpt[f'E_{i+1}_optim'])
+        self.D_optimizer.load_state_dict(ckpt['D_optim'])
+        self.expert.load_state_dict(ckpt[f'E_state_dict'])
+        self.loss[f'E_loss'] = ckpt[f'E_loss']
+        self.E_optimizer.load_state_dict(ckpt[f'E_optim'])
 
     @torch.no_grad()
     def evaluation(self) -> torch.Tensor:
         """
         TODO
         """
-        self.discriminator.eval()
+        with torch.no_grad():
+            self.discriminator.eval()
+            self.expert.eval()
 
-        # transf_scores[i] contains the scores that experts get for their outputs giving as input transformed samples with the mechanism i
-        transf_scores = [torch.zeros(self.hparams.num_experts, device=self.hparams.device) for idx_transf in self.train_dataset.idx_to_transf.keys()]
-        transf_n_samples = [0 for _ in self.train_dataset.idx_to_transf.keys()]
+            for batch in tqdm(self.eval_loader, desc="Eval... ", total=len(self.eval_loader)):
+                batch = batch.to(self.hparams.device)
+                batch_size = batch.num_graphs
+                x_transf = batch.pos_transf
+                batch_transf = batch.pos_transf_batch
 
-        for batch in tqdm(self.eval_loader, desc="Eval... ", total=len(self.eval_loader)):
-            batch = batch.to(self.hparams.device)
-            batch_size = batch.num_graphs
-            x_transf = batch.pos_transf
-            batch_transf = batch.pos_transf_batch
-
-            # Pass transformed data through experts
-            experts_scores = []
-            for expert in self.experts:
-                expert.eval()
-                exp_output = expert(pos=x_transf, batch=batch_transf)
+                # Pass transformed data through experts
+                exp_output = self.expert(pos=x_transf, batch=batch_transf)
+                # Get the score for each pointclopud in the batch
                 exp_scores = self.discriminator(exp_output.view(batch_size, -1, 3))
-                experts_scores.append(exp_scores)
-            
-            experts_scores = torch.cat(experts_scores, dim=1)
 
-            for idx, _ in enumerate(transf_scores):
-                indices = batch.transf.eq(torch.Tensor([idx]).to(self.hparams.device)).nonzero(as_tuple=False).squeeze(dim=-1)
-                n_indices = indices.shape[0]
-                if n_indices > 0:
-                    transf_n_samples[idx] += n_indices
-                    transf_scores[idx] += experts_scores[indices].sum(dim=0)
-
-        assert len(transf_scores) == len(transf_n_samples)
-        scores = {}
-        for idx, score in enumerate(transf_scores):
-            transf_scores[idx] = score / transf_n_samples[idx]
-            scores[f'{self.train_dataset.idx_to_transf[idx]}_scores'] = transf_scores[idx]
-        wandb.log(scores)
+            # return the mean of the scores
+            score = exp_scores.mean()
+            return score
 
     @torch.no_grad()
     def test(self) -> None:
@@ -380,16 +338,15 @@ class Trainer():
         point_clouds = {}
         with torch.no_grad():
             self.discriminator.eval()
-            for expert in self.experts:
-                expert.eval()
+            self.expert.eval()
 
-                # sample a point cloud for each digit from the dataset
-                samples = [random.sample(self.perclass_dataset[cls], 1)[0] for cls in range(self.train_dataset.num_classes)]
-                for data in samples:
-                    digit = data.y_transf.item()
-                    batch = Batch.from_data_list([data], follow_batch=['pos', 'pos_transf']).to(self.hparams.device)
-                    pred_pointcloud = expert(batch.pos_transf, batch.pos_transf_batch)
-                    score = self.discriminator(pred_pointcloud.unsqueeze(0)).item()
-                    point_clouds[f'pointcloud {digit}'] = wandb.Object3D(data.pos_transf.cpu().numpy())
-                    point_clouds[f'pointcloud {digit} - score: {score}'] = wandb.Object3D(pred_pointcloud.cpu().numpy())
+            # sample a point cloud for each digit from the dataset
+            samples = [random.sample(self.perclass_dataset[cls], 1)[0] for cls in range(self.train_dataset.num_classes)]
+            for data in samples:
+                digit = data.y_transf.item()
+                batch = Batch.from_data_list([data], follow_batch=['pos', 'pos_transf']).to(self.hparams.device)
+                pred_pointcloud = self.expert(batch.pos_transf, batch.pos_transf_batch)
+                score = self.discriminator(pred_pointcloud.unsqueeze(0)).item()
+                point_clouds[f'pointcloud {digit}'] = wandb.Object3D(data.pos_transf.cpu().numpy())
+                point_clouds[f'pointcloud {digit} - score: {score}'] = wandb.Object3D(pred_pointcloud.cpu().numpy())
         wandb.log(point_clouds)
